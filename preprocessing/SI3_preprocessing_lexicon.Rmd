@@ -1,0 +1,431 @@
+---
+title: |
+       | Supporting Information 3: Exploring correlations in genetic and cultural variation across language families in Northeast Asia
+       | 
+       | Preprocessing: Lexical Data^[The R code for this analysis was written by Balthasar Bickel.]
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+    fig_crop: true
+    fig_caption: yes
+    number_section: true
+    template: ../../../../../.pandoc/templates/default.latex
+bibliography: references.bib
+csl: ../../../../Bibliographies/repo/science.csl
+header_includes:
+  - \renewcommand{\thetable}{S\arabic{table}}
+  - \renewcommand{\thefigure}{S\arabic{figure}}
+  - \renewcommand{\thesection}{S\arabic{section}}
+---
+
+# Packages and Functions
+
+```{r libs, message=FALSE,warning=FALSE}
+library(knitr) 
+library(kableExtra) 
+library(tidyverse) 
+library(furrr) 
+library(dendextend) 
+library(reticulate) # Interface to Python
+use_python('/usr/local/bin/python3.6') # Parallelization below won't work in newer versions
+
+# Helper for exporting Neighbornets
+if(!require(RSplitsTree)) install_github('IVS-UZH/RSplitsTree')
+library(RSplitsTree) # SplitsTree file generation and invoking from R
+
+# Computing Levenshtein distances on vectorized strings
+Rcpp::sourceCpp("levenshtein.cpp") # written by Taras Zakharko
+
+# Helper for printing distance matrices:
+print_dist <- function(d, caption) {
+  d.m <- as.matrix(sort_dist_mat(d))
+  d.m[upper.tri(d.m, diag=T)] <- NA	
+  colnames(d.m) <- abbreviate(colnames(d.m), minlength=8)
+  rownames(d.m) <- abbreviate(rownames(d.m), minlength=8)
+  d.m <- d.m[2:nrow(d.m),1:ncol(d.m)-1]
+  kable(d.m, digits=3, format = 'latex', caption=caption) %>% 
+    kable_styling(latex_options = c("scale_down", "hold_position")) %>% 
+                  column_spec(1, border_left=T) %>% 
+                  column_spec(ncol(d.m)+1, border_right=T)
+  }
+```
+
+```{r setup, include=FALSE}
+opts_chunk$set(fig.path = 'figures/',
+           dev = 'cairo_pdf', dev.args = list(bg = 'transparent'), 
+                fig.height = 7,
+                fig.width = 14,
+                message = F,
+                warning = F,
+                autodep = T,
+                cache.comments = F,
+                crop = T,
+                pars = T,
+                out.extra = ''
+                )
+options(width = 180, knitr.kable.NA = '', knitr.table.format = "latex")
+```
+
+
+# Data
+
+We retrieve the ASJP version 19 database [@ASJP19] from \url{https://zenodo.org/record/3843469#.YCDeVC1Q0UE} and load the data relevant for the area. There are many missing values, but a closer inspection of their distribution suggests a break between concepts attested in at least 46 (74%) doculects^[different wordlists, dialects, sociolects, or any other varieties [@Goodetal2013Languoid].] vs. concepts attested in only 16 (25%) or fewer doculects. We retain only those with at least 46 attestation. This corresponds to the 40 best-coverage concepts chosen by [@Jager2018Global-scale] and to the ASJP core set (marked by an asterisks in the ASJP `Name` field).
+
+We chose the ASJP data because it covers all 14 languages for which we have matching data in grammar, phonology, music, and genetics. This is not the case for alternatives like \url{http://northeuralex.org} [@Dellertetal2020NorthEuraLex] that would include larger vocabularies (although many of which are recent borrowings or words with special trade histories like the word for tea').
+
+```{r data}
+asjp_register <- read_csv('asjp19-languages.csv') %>% 
+  select(ID, Glottocode, Glottolog_Name, ISO639P3code) %>% 
+  distinct()
+asjp_concepts <- read_csv("asjp19-parameters.csv")
+asjp_data_all <- read_csv('asjp19-forms.csv') %>%
+  inner_join(asjp_register[, c("ID","Glottocode","Glottolog_Name", "ISO639P3code")],
+             by = c("Language_ID" = "ID")) %>%
+  filter(Glottocode %in% c(
+    "kore1280", "nucl1643", "ainu1240",
+    "kory1246", "chuk1273", "yaku1245",
+    "even1260", "sout2750", "even1259",
+    "mong1330", # This is a different variety of Buriat; ASJP does not have buri1258
+    "kala1399", "selk1253",
+    "ngan1291", "gily1242"
+    )) %>% 
+  inner_join(asjp_concepts, by = c("Parameter_ID"= "ID"))
+
+best_concepts <- group_by(asjp_data_all, Concepticon_Gloss) %>% 
+  summarise(n=n_distinct(Language_ID)) %>% 
+  filter(n >= 46) %>% 
+  pull(Concepticon_Gloss)
+
+all(subset(asjp_concepts, grepl("*", Name, fixed = T))$Concepticon_Gloss %in% best_concepts)
+
+asjp_data <- filter(asjp_data_all, Concepticon_Gloss %in% best_concepts)
+
+```
+
+# PMI distances
+
+We measure lexical distances on the basis of alignments that are weighted by sound correspondence probabilities estimated by pointwise mutual information (PMI). PMI-weighted distances correspond better to distances in recognized phylogenies than other available methods of estimating lexical distances [@Jager2018Global-scale; @Jager2013Phylogenetic]. This suggests that they can also uncover distances that derive from historical process beyond individual language families, and this is why we use them for the main study.^[The gold standard for capturing phylogenetic relations stills relies on cognacy judgments that are careful screened and edited by experts [@Listetal2017The-Potential]. But cognacy judgments are defined only *within* families, and families need to be established first on independent grounds [@Nichols1996The-Comparative]] We computed PMI-weighted distances using Gerhard Jäger's Python script available from \url{https://osf.io/rbdwq/}. For this purpose, the data need to be reshaped into a wide format:
+
+```{r pmi-preprocessing}
+asjp_data_wide <- asjp_data %>% 
+  select(Concepticon_Gloss, Language_ID, Glottocode, ISO639P3code, Form) %>%
+  pivot_wider(names_from=Concepticon_Gloss,
+              values_from=Form,
+              # collect multiple values when they exist
+              values_fn = function(x) paste(x, collapse = ", ")
+  ) %>% 
+  # some data massage for the python code...
+  mutate_all(function(x) ifelse(is.na(x), "", x)) %>% 
+  column_to_rownames("Language_ID")
+```
+
+We then process the data in Python, calling in the pre-computed PMI scores and gap penalties from \url{https://osf.io/rbdwq/}. These scores and penalties are estimated on the global ASJP dataset (taking several days of computation), and so we do not re-compute them here.
+
+```{python pmi-computation}
+from numpy import *
+import pandas as pd
+import Levenshtein
+import re
+from Bio import pairwise2
+from scipy import stats,optimize
+from multiprocessing import Process,Manager
+ncores=8
+
+def cleanASJP(word):
+    """takes an ASJP string as argument
+    and returns the string with all diacritics removed."""
+    word = re.sub(r",","-",word)
+    word = re.sub(r"\%","",word)
+    word = re.sub(r"\*","",word)
+    word = re.sub(r"\"","",word)
+    word = re.sub(r".~","",word)
+    word = re.sub(r"(.)(.)(.)\$",r"\2",word)
+    word = re.sub(r"\$","",word)
+    word = re.sub(r"\s+","",word)
+    return word.replace('~','')
+
+# reading in R output:
+asjp = r.asjp_data_wide
+taxa = array(asjp.index)
+concepts = r.best_concepts
+
+# remove diacritics and correct minor syntactic inconsistencies
+asjpCleaned = pd.DataFrame([['-'.join([cleanASJP(w)
+                                       for w in x.split(',')]).replace('--','-').strip('-')
+                             if x!='' else ''
+                             for x in asjp[concepts].loc[l]]
+                            for l in taxa],
+                           columns=concepts,
+                           index=taxa)
+
+pmi = pd.read_csv('pmiScores.csv',index_col=0)
+
+sounds = array(pmi.index)
+
+pmiDict = dict()
+for s1 in sounds:
+    for s2 in sounds:
+        pmiDict[s1,s2] = pmi[s1][s2]
+
+gapPenalties = pd.read_csv('gapPenalties.csv',index_col=0,squeeze=True,header=None)
+gp1 = gapPenalties['gp1']
+gp2 = gapPenalties['gp2']
+
+def sscore(a,b,pmiDict,gp1,gp2):
+    """a,b: ASJP strings
+    pmiDict: logodds dictionary
+    gp1,gp2: gap penalties
+    return PMI score of a/b
+    """
+    out = pairwise2.align.globalds(a,b,pmiDict,gp1,gp2)
+    if len(out)==0: return nan
+    return out[0][2]
+
+def scoreNW(x,y,pmiDict,gp1,gp2):
+    """x,y: sequences of ASJP strings, separated by '-'
+    pmiDict: logodds dictionary
+    gp1,g2: gap penalties
+    returns maximal PMI score for the Cartesian product of x and y"""
+    if '0' in [x,y]: return nan
+    x1=x.split('-')
+    y1=y.split('-')
+    return max([sscore(xx,yy,pmiDict,gp1,gp2) for xx in x1 for yy in y1])
+
+minSim = -sqrt(40)
+maxSim = (log(40*(39)+1)-1)*sqrt(40)
+
+mtx = c_[taxa,asjpCleaned.values]
+mtx[mtx==''] = '0'
+
+# dercPMI is the distance measure that is called dERC/PMI in Jaeger (2013)
+def dercPMI(l1,l2,pmiDict,gp1,gp2,mtx=mtx,
+            minSim=minSim,maxSim=maxSim):
+    if not (l1 in mtx[:,0] and l2 in mtx[:,0]):
+        return nan
+    l1List = mtx[mtx[:,0]==l1,1:][0]
+    l2List = mtx[mtx[:,0]==l2,1:][0]
+    simMtr = array([[scoreNW(x,y,pmiDict,gp1=gp1,gp2=gp2) for x in l1List]
+                          for y in l2List])
+    dg = diag(simMtr)
+    dg = dg[isnan(dg)==False]
+    if len(dg)==0:
+        return 1.
+    fill_diagonal(simMtr,nan)
+    cmpr = simMtr[isnan(simMtr)==False]
+    ranks = array([stats.gmean(1.+arange(sum(cmpr>x),1.+sum(cmpr>=x)))
+                   for x in dg],double)
+    stc = mean(-log(ranks/(1+len(cmpr))))
+    sim = (stc-1)*sqrt(len(dg))
+    return (maxSim-sim)/(maxSim-minSim)
+
+lpairs = array([(l1,l2)
+                for i,l1 in enumerate(taxa)
+                for j,l2 in enumerate(taxa)
+                if i<j])
+
+packages = array_split(lpairs,ncores)
+
+manager = Manager()
+return_dict = manager.dict()
+
+def doWork(i,pck):
+    return_dict[i] = array([dercPMI(l1,l2,pmiDict,gp1,gp2)
+                            for l1,l2 in pck])
+
+jobs = []
+for i,pck in enumerate(packages):
+    p = Process(target=doWork,args=(i,pck))
+    p.start()
+    jobs.append(p)
+
+for p in jobs:
+    p.join()
+
+results = concatenate([return_dict[i] for i in range(ncores)])
+
+```
+
+Next, we reshape the output into a distance matrix and, from that, into a table of pairwise distances, adding back in Glottocodes and language names:
+
+```{r pmi-postprocessing}
+asjpPMI.dist <- structure(py$results, # python output
+                Size = length(py$taxa), # python output
+                Labels = py$taxa,
+                Diag = F,
+                Upper = F,
+                method = "user",
+                class = "dist")
+
+# all language pairs
+lg_pairs <- combn(attr(asjpPMI.dist, "Labels"), 2, simplify = FALSE)
+
+asjpPMI.df <- data.frame(Language.x = sapply(lg_pairs, "[[", 1),
+                         Language.y = sapply(lg_pairs, "[[", 2),
+                          py$results) %>% 
+  inner_join(asjp_register, by = c("Language.x" = "ID")) %>% 
+  inner_join(asjp_register, by = c("Language.y" = "ID"))
+```
+
+When there are several doculects per language, we take the mean distances.
+
+```{r pmi-aggregation}
+asjpPMI_aggregated.df <- asjpPMI.df %>% 
+  # we don't use group_by directly for aggregating per language, but impose order on
+  # how the pairs are coded because that makes it easier to push the pairs into a 
+  # `dist` object later:
+  mutate(pairs = paste0(Glottocode.x, "-", Glottocode.y)) %>%
+  mutate(ordered_pairs = unname(sapply(pairs, 
+                                       function(s) paste0(sort(strsplit(s[1], '-')[[1]]),
+                                                          collapse = '-')))) %>%
+  group_by(ordered_pairs) %>%
+  # we take the minimal distance in each pair of languages:
+  summarise(PMIDistance = mean(py.results),
+            .groups = "drop") %>%
+  # undo the pasting:
+  separate(ordered_pairs, c("Glottocode.x", "Glottocode.y")) %>%
+  # remove self-matches, setting them to be 0:
+  filter(Glottocode.x != Glottocode.y) %>% 
+  # add language names back in:
+  inner_join(unique(asjp_register[,c('Glottocode', 'Glottolog_Name')]), 
+             by = c("Glottocode.x" = "Glottocode")) %>%
+  inner_join(unique(asjp_register[,c('Glottocode', 'Glottolog_Name')]), 
+             by = c("Glottocode.y" = "Glottocode"))
+```
+
+We adapt the names in the main paper and write to `.nex` and `.csv` files for input into the main analyses (Supprting Information 1). The distancs are tabulated in Table 1 and visualized as a Neighbornet in Figure 1, with colors coding language relationships (blue: Tungusic; green: Chukotko-Kamchatkan; red: Uralic) shows a Neighbornet [@Husonetal2006Application] representation.
+
+```{r pmi-distance-matrices}
+languages <- unique(c(asjpPMI_aggregated.df$Glottolog_Name.x, 
+                      asjpPMI_aggregated.df$Glottolog_Name.y))
+languages[1] <- "Ainu"
+languages[5] <- "Nivkh" #gily1242
+languages[6] <- "West Greenlandic" # kala1399
+languages[9] <- "Buriat"
+languages[13] <- "Yukagir" # sout2750
+languages[14] <- "Yakut" # yaku1245
+
+asjpPMI.dist <- with(asjpPMI_aggregated.df, structure(PMIDistance,
+                                            Size = length(languages),
+                                            Labels = languages,
+                                            Diag = F,
+                                            Upper = F,
+                                            method = "user",
+                                            class = "dist"))
+splitstree(asjpPMI.dist, "asjp_dist_pmi.nex") # writing to nexus file
+asjpPMI.mat <- as.matrix(asjpPMI.dist)
+asjpPMI.mat[upper.tri(asjpPMI.mat)] <- NA
+write_csv(as.data.frame(asjpPMI.mat), "asjpPMI.dist.csv")
+print_dist(asjpPMI.dist, "Lexical lexical distances measured in PMI-weighted alignments")
+```
+
+![Two-dimensional split-graph summary of lexical distances measured by PMI-weighted alignments](asjp_dist_pmi.pdf)
+
+\clearpage
+
+# LDND distances
+
+We replicate the analysis with the older and more commonly used twice-normalized Levenshtein distances, known as "LDND" [@Holmanetal2008Advances; see @Greenhill2011 for critical discussion]. For efficiency, we reimplemented the computations here.^[We are grateful to Taras Zakharko for help with this.] When there are multiple entries for a concept per doculect, we pick again the mean distance (like we did when computing the PMI-weighted distances).
+
+Since LDND distances are not weighted by sound classes, we compare strings not in terms of the abstract (reduced) ASJP sound class representations, but in terms of the segmented phonological representations available in ASJP's `Segments` field. We recode these representations as character vectors and re-implement a Levenshtein distance measure that operates over these vectors. This procedure ensures that complex segments like /kh/ (aspirated k) are treated as single units that can be deleted, inserted or replaced, e.g. it allows sound changes like /kh/ → /x/ as the single step ("lenition") that it is.
+
+```{r ldnd-computation, cache = T}
+
+asjpLDND.df <-
+  # get all language pairs and set up a table with one pair per row
+  combn(sort(unique(asjp_data$Glottocode)), 2, simplify = FALSE) %>%
+  map_dfr(~ tibble(Glottocode.x = .[[1]], Glottocode.y = .[[2]])) %>%
+  # process by pair in parallel
+  future_pmap_dfr(function(Glottocode.x, Glottocode.y) {
+
+    # get wordlists for both languages
+    # Test example: Glottocode.x <- "ainu1240"; Glottocode.y = 'chuk1273'
+    wordlist.x <- filter(asjp_data, Glottocode == Glottocode.x)
+    wordlist.y <- filter(asjp_data, Glottocode == Glottocode.y)
+
+    # build a list of all word pairs; for the second normalization below
+    # we need both pairs of forms for the same concept and 
+    # pairs of forms for different concepts
+    ii <- expand_grid(
+      x = seq_len(nrow(wordlist.x)),
+      y = seq_len(nrow(wordlist.y))
+    )
+    wordpairs <- tibble(
+      slice(wordlist.x, ii$x) %>% rename_with(~ str_c(., ".x")),
+      slice(wordlist.y, ii$y) %>% rename_with(~ str_c(., ".y"))
+    )
+    # compute the distances for each pair of forms
+    wordpairs <- wordpairs %>%
+      mutate(
+        # parsing the segmented representations:
+        seg_seq.x = str_split(Segments.x, " +"),
+        seg_seq.y = str_split(Segments.y, " +"),
+        seg_length.x = map_int(seg_seq.x, length),
+        seg_length.y = map_int(seg_seq.y, length)
+      ) %>%
+      mutate(
+        # segment-based Levenshtein distance:
+        LD = map2_int(seg_seq.x, seg_seq.y, levenshtein_distance),
+        # first normalization, by string length:
+        LDN = LD/pmax(seg_length.x, seg_length.y)
+      ) %>%
+      # for each concept pair, pick the mean distance between forms: 
+      group_by(Concepticon_Gloss.x, Concepticon_Gloss.y) %>%
+      summarize(
+        meanLDN = mean(LDN),
+        .groups = "drop"
+      )
+
+     # aggregate and compute LDND from LDN (second normalization):
+    tibble(
+      # header
+      Glottocode.x = Glottocode.x,
+      Glottocode.y = Glottocode.y,
+      # divide the mean distance between forms for the same concept
+      # by the mean distance between forms for different concepts:
+      wordpairs %>%
+      summarize(
+        LDND = mean(meanLDN[Concepticon_Gloss.x == Concepticon_Gloss.y])/
+               mean(meanLDN[Concepticon_Gloss.x != Concepticon_Gloss.y])
+      )
+    )
+  }, .options = furrr_options(scheduling = Inf))
+```
+
+We add language names and reshape into distance matrix. Table 2 summarizes the full distance matrix and Figure 2 shows a Neighbornet [@Husonetal2006Application] representation.
+
+```{r ldnd-distance-matrix}
+# add language names:
+asjpLDND_named.df <- asjpLDND.df %>%
+  inner_join(unique(asjp_register[,c("Glottocode", "Glottolog_Name")]), 
+             by = c("Glottocode.x" = "Glottocode")) %>%
+  inner_join(unique(asjp_register[,c("Glottocode", "Glottolog_Name")]), 
+             by = c("Glottocode.y" = "Glottocode"))
+
+languages <- unique(c(asjpLDND_named.df$Glottolog_Name.x, 
+                      asjpLDND_named.df$Glottolog_Name.y))
+languages[1] <- "Ainu"
+languages[5] <- "Nivkh" #gily1242
+languages[6] <- "West Greenlandic" # kala1399
+languages[9] <-  "Buriat"
+languages[13] <- "Yukagir" # sout2750
+languages[14] <- "Yakut" # yaku1245
+
+asjpLDND.dist <- with(asjpLDND_named.df, structure(LDND,
+                                         Size = length(languages),
+                                         Labels = languages,
+                                         Diag = FALSE,
+                                         Upper = FALSE,
+                                         method = "user",
+                                         class = "dist"))
+splitstree(asjpLDND.dist) # write to .nex
+print_dist(asjpLDND.dist, "Lexical lexical distances measured by twice-normalized Levenshtein comparisons")
+```
+
+
+![Two-dimensional split-graph summary of lexical distances measured by twice-normalized Levenshtein alignments](asjpLDND-dist.pdf)
+
+\clearpage
+
+# References
+

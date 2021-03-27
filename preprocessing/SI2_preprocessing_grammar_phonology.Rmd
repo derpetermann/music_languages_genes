@@ -1,0 +1,248 @@
+---
+title: |
+       | Supporting Information 2: Exploring correlations in genetic and cultural variation across   language families in Northeast Asia 
+       |
+       | Preprocessing: Grammar and Phonology^[The R code for this analysis was written by Balthasar Bickel, Peter Ranacher, and Damián E. Blasi]
+output: 
+  pdf_document:
+    keep_tex: yes
+    latex_engine: xelatex
+    fig_crop: true
+bibliography: ../genetics.bib
+header-includes:
+ - \usepackage[Symbol]{upgreek}
+ - \usepackage{tocloft}
+ - \settowidth{\cftsubsecnumwidth}{S4.5x}
+ - \settowidth{\cftsecnumwidth}{S4.i}
+ - \setcounter{table}{12}
+ - \renewcommand{\thetable}{S\arabic{table}}
+---
+
+
+```{r setup, include=FALSE}
+library(knitr) # A General-Purpose Package for Dynamic Report Generation in R
+library(kableExtra) # Construct Complex Table with 'kable' and Pipe Syntax, CRAN v1.3.1
+library(tidyverse) # Easily Install and Load the 'Tidyverse', CRAN v1.3.0
+
+opts_chunk$set(fig.path = 'figures/',
+           dev = 'cairo_pdf', dev.args = list(bg = 'transparent'), 
+                fig.height = 7,
+                fig.width = 14,
+                message = F,
+                warning = F,
+                autodep = T,
+                cache.comments = F,
+                crop = T,
+                pars = T,
+                out.extra = ''
+                )
+options(width = 180, knitr.kable.NA = '', knitr.table.format = "latex")
+```
+
+Data on grammar and phonology are aggregated from the following sources:
+
+- AUTOTYP (*34*)
+- WALS (*33*), enriched by recodings (*65*)
+- ANU Phonotactics database (*35*)
+- PHOIBLE (*36*)
+
+The split into phonology vs. grammar is based on the broad definition in `categorization_of_variables.csv` which includes phonotactic and morphophonological data under phonology.^[Available at  https://github.com/derpetermann/music_languages_genes] We extract a subset from the data comprising languages from fourteen different societies. Note that in AUTOTYP and WALS, Buriat is represented by ISO code `bua` (Buriat in general), while in PHOIBLE  it is represented by ISO code  `bxr` and in the ANU data by `bxm`. We mapped all of them below to `bua`. For details, see Supporting Information: Variables for Grammar and Phonology. 
+```{r lingdata, cache=T}
+
+# Define single languages and family-related languages
+single_lgs <- c("Ainu", "Buryat", "Japanese", "Korean", "Nivkh", "West Greenlandic", 
+                "Yakut", "Yukagir")
+uralic <- c("Selkup", "Nganasan")
+chkkat <- c("Chukchi", "Koryak")
+tungus <- c("Even", "Evenki")
+
+# Read categorization of variables
+var_categories <- read.csv("../data/typology/categorization_of_variables.csv",
+                           stringsAsFactors = F)
+
+
+# Read the grammar, phonology and typlogy data (meta data)
+typology.list <- readRDS("../data/typology/typology.list.RDS")
+phonological_vars <- unlist(as.character(sapply(typology.list, function(x) {
+        var_categories[var_categories$Variable == x[1, "variable.ID"], 
+                       "Broad_Phon_Definition_Binary"] == "Phonology" }) ))
+phonology_list <- typology.list[phonological_vars == "TRUE"]
+grammar_vars <- unlist(as.character(sapply(typology.list, function(x) {
+        var_categories[var_categories$Variable == x[1, "variable.ID"], 
+                       "Broad_Phon_Definition_Binary"] == "Grammar" })))
+grammar_list <- typology.list[grammar_vars == "TRUE"]
+typology_coverage_df <- readRDS("../data/typology/typology.coverage.RDS")
+
+# Define subset
+siberia_sample <- c(
+ "[i-ain][a-12][g-ainu1240]",    # Ainu
+ "[i-bua][a-1095][g-buri1258]",  # Buriat
+ "[i-bxm][a-][g-mong1330]",      # Buriat (Mongolia)
+ "[i-bxr][a-][g-russ1264]",      # Buriat (Russia)
+ "[i-ckt][a-56][g-chuk1273]",    # Chukchi
+ "[i-eve][a-738][g-even1260]",   # Even
+ "[i-evn][a-527][g-even1259]",   # Evenki
+ "[i-kal][a-511][g-kala1399]",   # West Greenlandic
+ "[i-jpn][a-118][g-nucl1643]",   # Japanese
+ "[i-kor][a-141][g-kore1280]",   # Korean
+ "[i-kpy][a-1808][g-kory1246]",  # Koryak
+ "[i-nio][a-2172][g-ngan1291]",  # Nganasan
+ "[i-niv][a-433][g-gily1242]",   # Nivkh
+ "[i-sel][a-2393][g-selk1253]",  # Selkup
+ "[i-sah][a-2662][g-yaku1245]",  # Yakut
+ "[i-ykg][a-423][g-nort2745]")   # Yukagir (Tundra)
+
+# Extract meta data for the above subset
+siberia_metadata_all <- subset(typology_coverage_df, UULID %in% siberia_sample)
+siberia_metadata <- subset(siberia_metadata_all, !isocode %in% c('bxm','bxr'))
+
+counts <- xtabs(~autotyp.Stock, siberia_metadata, drop.unused.levels = T)
+rownames(siberia_metadata) <- with(siberia_metadata,
+                                   ifelse(autotyp.Stock %in% names(counts[counts>1]),
+                                          paste(autotyp.Stock, autotyp.Language, sep="/"),
+                                          paste(autotyp.Language)))
+
+rownames(siberia_metadata) <- gsub('Yukagir/','', rownames(siberia_metadata))
+```
+
+
+We only use variables with one data point per language, and only variables with non-constant values (which otherwise can't deliver a distance signal). At the same time, we also remap `bxr` and `bxm` to `bua` (cf. above). We trim the linguistic data accordingly.
+
+```{r trimllingdata, cache=T}
+
+trim_data <- function(data.list, trim.to=siberia_metadata_all, extra.coverage=.8) {
+ #' Trims the linguistic input data and only keeps variables with
+ #' data points for languages in the study area and with non-constant values
+
+ #' @param data.list the data to be trimmed
+ #' @param trim.to contains the ids of those languages that are retained after trimming  
+ #' @param extra.coverage the percentage of covered data
+ #' @return the trimmed data
+
+  lgs <- lapply(data.list, function(l) {
+	  l$UULID <- ifelse(l$isocode %in% c('bxm','bxr'),
+	  		   '[i-bua][a-1095][g-buri1258]',
+		      paste(l$UULID))
+	  subset(l, UULID %in% trim.to$UULID)
+	 })
+  vars <- lgs[sapply(lgs, function(l) {
+	   length(l$UULID)==length(unique(l$UULID)) &
+	   length(unique(l[,1]))>1 &
+	     length(unique(l$UULID)) >= floor(extra.coverage*length(trim.to$UULID))
+	  })]
+  return(lapply(vars, function(l) l[,c(1,3)]))}
+
+# Trim the data
+siberia_grammar_list <- trim_data(grammar_list,extra.coverage = 0.8)
+siberia_phonology_list <- trim_data(phonology_list,extra.coverage = 0.8)
+```
+
+The following lists the phonological variables we captured. For full definitions and descriptions of the variables, see the source databases listed above.
+```{r phonvar, echo=F, cache=T}
+cat(paste('-', names(siberia_phonology_list)), sep='\n')
+```
+
+And these the grammar variables:
+
+```{r grammvar, echo=F, cache=T}
+cat(paste("-", names(siberia_grammar_list)), sep = "\n")
+```
+
+For each society we compute the coverage, i.e. the percentage of available variables per society.  
+
+```{r lingcoverage, message=FALSE, warning=FALSE, cache=T}
+
+compute_coverage <- function(data.list, gg=siberia_metadata) {
+ #' Computes the coverage of all languages
+ #' @param data.list the input data 
+ #' @param gg a data.frame comprising the languages for which the coverage is computed
+ #' @return the input data with the coverage added as a separate column
+
+  x <- sapply(gg$UULID, function(l) {
+          coverage <- round(mean(sapply(data.list, function(v) { l %in% v$UULID })),2)*100
+        })
+  df <- data.frame(UULID=names(x), Coverage=x)
+  gg$Language <- rownames(gg)
+  df.g <- merge(df, gg)
+  return(df.g)}
+
+# Compute the coverage for each variable
+grammar_coverage <- compute_coverage(siberia_grammar_list) %>% 
+  dplyr::select(Language, Coverage)
+phonology_coverage <- compute_coverage(siberia_phonology_list) %>% 
+  dplyr::select(Language, Coverage)
+```
+
+We simplify and standardize the language names and visualize the coverage in a table. Finally, we flatten the nested linguistic data and convert them to data frames. 
+```{r lingcleanup, message=FALSE, warning=FALSE, cache=T, echo=F}
+
+# Change variable names (see next section)
+# Grammar
+grammar_coverage[grammar_coverage$Language == 'Chukchi-Kamchatkan/Chukchi', 
+                 "Language"] <-'Chukchi'
+grammar_coverage[grammar_coverage$Language == 'Tungusic/Evenki', "Language"] <- 'Evenki'
+grammar_coverage[grammar_coverage$Language == 'Greenlandic Eskimo (West)', 
+                 "Language"] <-'West Greenlandic'
+grammar_coverage[grammar_coverage$Language == 'Uralic/Selkup', "Language"] <- 'Selkup'
+grammar_coverage[grammar_coverage$Language == 'Yukagir (Tundra)', "Language"] <- 'Yukagir'
+grammar_coverage[grammar_coverage$Language == 'Tungusic/Even', "Language"] <- 'Even'
+grammar_coverage[grammar_coverage$Language == 'Buriat', "Language"] <- 'Buryat'
+grammar_coverage[grammar_coverage$Language == 'Uralic/Nganasan', "Language"] <- 'Nganasan'
+grammar_coverage[grammar_coverage$Language == 'Chukchi-Kamchatkan/Koryak', 
+                 "Language"] <- 'Koryak'
+
+# Phonology
+phonology_coverage[phonology_coverage$Language == 'Chukchi-Kamchatkan/Chukchi', 
+                   "Language"] <-'Chukchi'
+phonology_coverage[phonology_coverage$Language == 'Tungusic/Evenki', "Language"] <- 'Evenki'
+phonology_coverage[phonology_coverage$Language == 'Greenlandic Eskimo (West)', 
+                   "Language"] <-'West Greenlandic'
+phonology_coverage[phonology_coverage$Language == 'Uralic/Selkup', "Language"] <- 'Selkup'
+phonology_coverage[phonology_coverage$Language == 'Yukagir (Tundra)', 
+                   "Language"] <- 'Yukagir'
+phonology_coverage[phonology_coverage$Language == 'Tungusic/Even', "Language"] <- 'Even'
+phonology_coverage[phonology_coverage$Language == 'Buriat', "Language"] <- 'Buryat'
+phonology_coverage[phonology_coverage$Language == 'Uralic/Nganasan', 
+                   "Language"] <- 'Nganasan'
+phonology_coverage[phonology_coverage$Language == 'Chukchi-Kamchatkan/Koryak', 
+                   "Language"] <- 'Koryak'
+
+# Visualize the coverage in a table
+inner_join(grammar_coverage, phonology_coverage, by='Language') %>% 
+  arrange(desc(Coverage.x)) %>%
+kable (booktabs=T, linesep = "", 
+      caption ='Language data coverage for all fourteen societies.',
+      col.names=c('Language','Grammar (%)', 'Phonology (%)')) %>%
+      kable_styling()
+```
+
+\clearpage
+
+```{r flatdata, cache=T}
+
+flatten <- function(data.list, gg=siberia_metadata) {
+ #' Flattens the nested linguistic data
+ #' @param data.list: the input data
+ #' @param gg: a data.frame comprising the languages for which the data are flattened
+ #' @return the flattened data
+  
+  df.list <- lapply(seq_along(data.list), function(v) {
+    df <- data.list[[v]]
+    var.name <- gsub('(.*\\$)', '\\2', names(data.list)[v])
+    names(df)[1] <- var.name
+    return(dplyr::select(df, UULID, dplyr::everything()))
+    })
+  df.flat <- Reduce(function(x,y) dplyr::full_join(x, y, by='UULID'), df.list)
+  rownames(df.flat) <- sapply(df.flat$UULID, function(x) rownames(gg[gg$UULID %in% x,]))
+  return(df.flat)}
+
+# Flatten the data
+grammar <- flatten(siberia_grammar_list)
+phonology <- flatten(siberia_phonology_list)
+```
+
+```{r write to file, include=FALSE, eval=F}
+write.csv(grammar, "../data/grammar/grammar_var.csv", na="")
+write.csv(phonology, "../data/phonology/phon_var.csv", na="")
+
+```
